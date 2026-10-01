@@ -1,0 +1,20 @@
+# Reference values. train.py takes the same names as CLI flags.
+episode:
+  start_cash: 20.0      # $ per epoch, as specified
+  target: 30.0          # must reach 30+
+  decision_every: 5     # minutes between decisions -> 288 steps/day
+  fee: 0.0004           # 4 bp taker
+  slippage_bp: 1.0
+  max_gross: 1.0        # gross exposure cap (abs weights sum)
+ppo:
+  gamma: 0.995
+  lam: 0.95
+  clip: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  ppo_epochs: 4
+  lr: 0.0003
+advisor:
+  every: 60             # re-read news once per simulated hour
+  trail_days: 7         # trailing context window
+  point_in_time: true   # NEVER show articles published after the current minute

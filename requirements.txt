@@ -1,0 +1,9 @@
+# All installable from PyPI - nothing is fetched from the network at run time.
+torch>=2.2
+transformers>=4.40,<5
+tokenizers>=0.19
+safetensors>=0.4
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14
+matplotlib>=3.7

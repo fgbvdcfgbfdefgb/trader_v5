@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+outputs/advisor_cache/
+outputs/epochs/
+outputs/checkpoints/
+outputs/*.jsonl
+outputs/*.png
+.venv/
+venv/
