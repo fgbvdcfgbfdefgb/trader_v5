@@ -80,18 +80,53 @@ class MarketData:
         self._index = self._build_index()
 
     # ---------- index of tradable days ----------
+    def _index_cache_path(self):
+        return os.path.join(self.root, "_day_index.json")
+
     def _build_index(self):
+        """
+        Days where every asset has >=97% of its 1440 bars.
+
+        Cached to disk: scanning 14M timestamps costs real time on a loaded
+        box, and the answer only changes when the Parquet files change.
+        """
+        import json
+        sig = {}
+        for a in self.assets:
+            for f in sorted(glob.glob(os.path.join(self.root, a, "*.parquet"))):
+                st = os.stat(f)
+                sig[os.path.relpath(f, self.root)] = [st.st_size, int(st.st_mtime)]
+
+        cp = self._index_cache_path()
+        if os.path.exists(cp):
+            try:
+                blob = json.load(open(cp))
+                if blob.get("sig") == sig and blob.get("assets") == list(self.assets):
+                    return blob["days"]
+            except Exception:
+                pass
+
+        thresh = int(MIN_PER_DAY * 0.97)
         per = {}
         for a in self.assets:
             days = set()
             for f in sorted(glob.glob(os.path.join(self.root, a, "*.parquet"))):
                 d = pd.read_parquet(f, columns=["open_time"])
                 ts = pd.to_datetime(d["open_time"], unit="ms", utc=True)
-                vc = ts.dt.strftime("%Y-%m-%d").value_counts()
-                days |= set(vc[vc >= int(MIN_PER_DAY * 0.97)].index)
+                # vectorised floor-to-day; strftime only on the ~365 survivors
+                vc = ts.dt.floor("D").value_counts()
+                keep = vc[vc >= thresh].index
+                days |= set(pd.DatetimeIndex(keep).strftime("%Y-%m-%d"))
             per[a] = days
-        common = set.intersection(*per.values())
-        return sorted(common)
+        common = sorted(set.intersection(*per.values()))
+
+        try:
+            with open(cp, "w") as fh:
+                json.dump({"sig": sig, "assets": list(self.assets),
+                           "days": common}, fh)
+        except Exception:
+            pass
+        return common
 
     @property
     def days(self):

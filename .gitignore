@@ -14,3 +14,4 @@ outputs/
 
 .venv/
 venv/
+_day_index.json
