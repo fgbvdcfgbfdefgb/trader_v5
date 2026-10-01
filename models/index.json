@@ -1,0 +1,29 @@
+{
+  "finbert": {
+    "repo": "ProsusAI/finbert",
+    "task": "sentiment",
+    "labels": [
+      "positive",
+      "negative",
+      "neutral"
+    ]
+  },
+  "cryptobert": {
+    "repo": "ElKulako/cryptobert",
+    "task": "sentiment",
+    "labels": [
+      "bearish",
+      "neutral",
+      "bullish"
+    ]
+  },
+  "fin_distilroberta": {
+    "repo": "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
+    "task": "sentiment",
+    "labels": [
+      "negative",
+      "neutral",
+      "positive"
+    ]
+  }
+}
