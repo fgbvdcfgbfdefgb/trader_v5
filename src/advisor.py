@@ -45,15 +45,23 @@ class NewsStore:
             self.df = self.df.dropna(subset=["dt"]).sort_values("dt")
             self.df = self.df.drop_duplicates(subset=["url", "asset"])
             self.df = self.df.reset_index(drop=True)
-            self._dt = self.df["dt"].to_numpy()
+            # tz-aware -> naive UTC datetime64[ns] so searchsorted is numeric.
+            # (a tz-aware .to_numpy() yields an object array and breaks it)
+            self._dt = (self.df["dt"].dt.tz_convert("UTC").dt.tz_localize(None)
+                        .to_numpy(dtype="datetime64[ns]"))
 
     def window(self, end_ts, trail_days=TRAIL_DAYS, limit=120):
         """All articles in (end_ts - trail_days, end_ts]. Never future."""
         if not len(self.df):
             return self.df
+        end_ts = pd.Timestamp(end_ts)
+        if end_ts.tz is None:
+            end_ts = end_ts.tz_localize("UTC")
         start = end_ts - pd.Timedelta(days=trail_days)
-        i0 = np.searchsorted(self._dt, np.datetime64(start.tz_convert("UTC").tz_localize(None)), "right")
-        i1 = np.searchsorted(self._dt, np.datetime64(end_ts.tz_convert("UTC").tz_localize(None)), "right")
+        a = np.datetime64(start.tz_convert("UTC").tz_localize(None), "ns")
+        b = np.datetime64(end_ts.tz_convert("UTC").tz_localize(None), "ns")
+        i0 = int(np.searchsorted(self._dt, a, "right"))
+        i1 = int(np.searchsorted(self._dt, b, "right"))   # strict: no future
         sl = self.df.iloc[i0:i1]
         if len(sl) > limit:
             sl = sl.tail(limit)

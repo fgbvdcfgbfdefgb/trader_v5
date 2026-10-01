@@ -132,7 +132,7 @@ def save_epoch_png(path, epoch, day, env_hist, info, assets, advisor_notes,
         v = losses.get(k, [])
         if len(v):
             v = np.asarray(v, float)
-            v = (v - v.min()) / (v.ptp() + 1e-9)
+            v = (v - v.min()) / (np.ptp(v) + 1e-9)   # ndarray.ptp() gone in numpy 2
             ax.plot(v, lw=1.1, color=c, label=k)
     ax.set_title("training losses (min-max normalised)")
     ax.legend(fontsize=7, framealpha=0.2)
