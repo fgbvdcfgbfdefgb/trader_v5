@@ -1,0 +1,41 @@
+{
+  "repo": "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
+  "task": "sentiment",
+  "labels": [
+    "negative",
+    "neutral",
+    "positive"
+  ],
+  "files": {
+    "config.json": {
+      "chunks": 0,
+      "size": 933,
+      "sha256": "c4128a9b546f4ea50590ca60db1e2bbadfd3726b8e1e70441be1b741a1083a72"
+    },
+    "vocab.json": {
+      "chunks": 0,
+      "size": 798293,
+      "sha256": "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e"
+    },
+    "merges.txt": {
+      "chunks": 0,
+      "size": 456356,
+      "sha256": "fe36cab26d4f4421ed725e10a2e9ddb7f799449c603a96e7f29b5a3c82a95862"
+    },
+    "tokenizer_config.json": {
+      "chunks": 0,
+      "size": 333,
+      "sha256": "5066b57002ab15418f3472aa53a8b083878f84050e8153ba62b9d40e10651a4c"
+    },
+    "special_tokens_map.json": {
+      "chunks": 0,
+      "size": 239,
+      "sha256": "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d"
+    },
+    "pytorch_model.bin": {
+      "chunks": 4,
+      "size": 328529005,
+      "sha256": "c6d24cd7c45f0b65241fd9ff1aa97814eea3ab7bdbf1458248fb9f4b2c817864"
+    }
+  }
+}
