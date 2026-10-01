@@ -85,6 +85,8 @@ class LLMAdvisor:
         self.index = json.load(open(idx_p)) if os.path.exists(idx_p) else {}
         self.model_names = model_names or list(self.index.keys())
         self._loaded = {}
+        self._tcache = None
+        self._tdirty = 0
 
     # ---------- model plumbing ----------
     def _load(self, name):
@@ -99,46 +101,139 @@ class LLMAdvisor:
         mdl = AutoModelForSequenceClassification.from_pretrained(
             d, local_files_only=True)
         mdl.eval()
-        lab = {i: l.lower() for i, l in mdl.config.id2label.items()}
-        self._loaded[name] = (tok, mdl, lab)
+        lab = {int(i): str(l).lower() for i, l in mdl.config.id2label.items()}
+        mf = os.path.join(d, "manifest.json")
+        fb = json.load(open(mf)).get("labels") if os.path.exists(mf) else None
+        self._loaded[name] = (tok, mdl, lab, fb)
         return self._loaded[name]
 
-    @staticmethod
-    def _polarity(labels, probs):
-        """Map any 3-class sentiment head onto a single [-1, 1] score."""
+    POS_WORDS = ("positive", "bullish", "bull", "optimistic", "up")
+    NEG_WORDS = ("negative", "bearish", "bear", "pessimistic", "down")
+    NEU_WORDS = ("neutral", "none")
+
+    @classmethod
+    def _polarity(cls, labels, probs, fallback=None):
+        """
+        Map any 3-class sentiment head onto a single [-1, 1] score.
+
+        Matches on whole sentiment words. If a model ships anonymous
+        LABEL_0/1/2 names, fall back to the ordered label list recorded in
+        manifest.json rather than guessing from digits.
+        """
+        def side(name):
+            n = name.strip().lower()
+            if any(w == n or w in n.split("_") or n.startswith(w)
+                   for w in cls.NEU_WORDS):
+                return 0
+            if any(w == n or n.startswith(w) for w in cls.POS_WORDS):
+                return 1
+            if any(w == n or n.startswith(w) for w in cls.NEG_WORDS):
+                return -1
+            return None
+
         pos = neg = 0.0
+        resolved = False
         for i, l in labels.items():
+            i = int(i)
             if i >= len(probs):
                 continue
-            if any(k in l for k in ("pos", "bull", "1")) and "neg" not in l:
+            s = side(l)
+            if s is None:
+                continue
+            resolved = True
+            if s > 0:
                 pos += probs[i]
-            elif any(k in l for k in ("neg", "bear", "0")) and "pos" not in l:
+            elif s < 0:
                 neg += probs[i]
+
+        if not resolved and fallback:
+            for i, l in enumerate(fallback):
+                if i >= len(probs):
+                    break
+                s = side(l)
+                if s and s > 0:
+                    pos += probs[i]
+                elif s and s < 0:
+                    neg += probs[i]
         return float(pos - neg)
+
+    # ---- persistent per-headline score cache -------------------------------
+    # Consecutive hours share a 7-day trailing window, so the same headline is
+    # re-scored hundreds of times across an episode and across epochs. Scoring
+    # each unique title once and remembering it is the single biggest speedup
+    # available on a CPU-bound advisor.
+    def _tcache_path(self):
+        return os.path.join(self.cache_dir, "title_scores.pkl")
+
+    def _load_tcache(self):
+        if self._tcache is not None:
+            return self._tcache
+        import pickle
+        try:
+            with open(self._tcache_path(), "rb") as f:
+                self._tcache = pickle.load(f)
+        except Exception:
+            self._tcache = {}
+        return self._tcache
+
+    def save_cache(self):
+        if not self._tcache or not self._tdirty:
+            return
+        import pickle, tempfile
+        try:
+            d = os.path.dirname(self._tcache_path())
+            with tempfile.NamedTemporaryFile("wb", dir=d, delete=False) as f:
+                pickle.dump(self._tcache, f, protocol=4)
+                tmp = f.name
+            os.replace(tmp, self._tcache_path())
+            self._tdirty = 0
+        except Exception:
+            pass
+
+    @staticmethod
+    def _tkey(t):
+        return hashlib.md5(t.strip().lower().encode("utf8")).hexdigest()[:16]
 
     def score_texts(self, texts):
         if not texts or not self.enabled or not self.model_names:
             return np.zeros(len(texts), np.float32)
-        import torch
-        acc = np.zeros(len(texts), np.float64)
-        used = 0
-        for name in self.model_names:
-            try:
-                tok, mdl, lab = self._load(name)
-            except Exception:
+        cache = self._load_tcache()
+        keys = [self._tkey(t) for t in texts]
+        todo, seen = [], {}
+        for t, k in zip(texts, keys):
+            if k in cache or k in seen:
                 continue
-            out = []
-            with torch.no_grad():
-                for i in range(0, len(texts), self.batch):
-                    b = texts[i:i + self.batch]
-                    enc = tok(b, padding=True, truncation=True, max_length=96,
-                              return_tensors="pt")
-                    lg = mdl(**enc).logits
-                    pr = torch.softmax(lg, -1).numpy()
-                    out.extend(self._polarity(lab, p) for p in pr)
-            acc += np.asarray(out, np.float64)
-            used += 1
-        return (acc / max(used, 1)).astype(np.float32)
+            seen[k] = True
+            todo.append((k, t))
+
+        if todo:
+            import torch
+            uniq = [t for _, t in todo]
+            acc = np.zeros(len(uniq), np.float64)
+            used = 0
+            for name in self.model_names:
+                try:
+                    tok, mdl, lab, fb = self._load(name)
+                except Exception:
+                    continue
+                out = []
+                with torch.no_grad():
+                    for i in range(0, len(uniq), self.batch):
+                        b = uniq[i:i + self.batch]
+                        enc = tok(b, padding=True, truncation=True,
+                                  max_length=96, return_tensors="pt")
+                        pr = torch.softmax(mdl(**enc).logits, -1).numpy()
+                        out.extend(self._polarity(lab, p, fb) for p in pr)
+                acc += np.asarray(out, np.float64)
+                used += 1
+            acc /= max(used, 1)
+            for (k, _), v in zip(todo, acc):
+                cache[k] = float(v)
+            self._tdirty += len(todo)
+            if self._tdirty >= 400:
+                self.save_cache()
+
+        return np.asarray([cache.get(k, 0.0) for k in keys], np.float32)
 
     # ---------- the feature the agents actually see ----------
     def features_at(self, ts, assets):
@@ -215,4 +310,5 @@ class LLMAdvisor:
             notes.append((str(timestamps[i]), s))
             last_i = i
         out[last_i:] = prev
+        self.save_cache()
         return out, notes

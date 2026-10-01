@@ -1,9 +1,16 @@
 __pycache__/
 *.pyc
-outputs/advisor_cache/
-outputs/epochs/
-outputs/checkpoints/
-outputs/*.jsonl
-outputs/*.png
+*.pyo
+
+# assembled model weights - the repo ships the .partNNN chunks instead,
+# models/assemble.py rebuilds these locally (they exceed GitHub's 100MB limit)
+models/*/pytorch_model.bin
+models/*/model.safetensors
+models/*/*.tmp
+
+# run artifacts
+outputs/
+!outputs/.gitkeep
+
 .venv/
 venv/

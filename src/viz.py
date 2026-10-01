@@ -164,12 +164,18 @@ def save_epoch_png(path, epoch, day, env_hist, info, assets, advisor_notes,
     lines = ["LLM ADVISOR - point-in-time news visible to the agent on "
              f"{day} (nothing published after each timestamp):"]
     for ts, note in (advisor_notes or [])[:7]:
-        lines.append(f"  {str(ts)[:16]}  {note[:155]}")
+        # '$' would otherwise be swallowed by matplotlib's mathtext parser
+        lines.append(f"  {str(ts)[:16]}  {note[:155]}".replace("$", r"\$"))
     if len(advisor_notes or []) == 0:
         lines.append("  (no news available in window)")
-    ax.text(0.005, 0.97, "\n".join(lines), va="top", ha="left",
-            family="monospace", fontsize=7.0, color="#b9c4d0",
-            transform=ax.transAxes)
+    try:
+        ax.text(0.005, 0.97, "\n".join(lines), va="top", ha="left",
+                family="monospace", fontsize=7.0, color="#b9c4d0",
+                transform=ax.transAxes, parse_math=False)
+    except TypeError:                      # matplotlib < 3.6
+        ax.text(0.005, 0.97, "\n".join(lines), va="top", ha="left",
+                family="monospace", fontsize=7.0, color="#b9c4d0",
+                transform=ax.transAxes)
 
     fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)

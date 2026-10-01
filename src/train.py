@@ -405,6 +405,192 @@ def trader_proc(cfg, q, shared, stop):
         traceback.print_exc(); stop.set()
 
 
+
+# ----------------------------------------------------------------------------
+# serial mode: everything in ONE process (debugging, and single-node setups
+# where spawning 4 CUDA contexts is wasteful)
+# ----------------------------------------------------------------------------
+def serial_loop(cfg, nepochs):
+    dev = torch.device(cfg["dev_trader"])
+    nA = len(ASSETS)
+    d = cfg["d_model"]
+    rng = np.random.default_rng(cfg["seed"])
+
+    md = MarketData(os.path.join(ROOT, "data", "market"), ASSETS)
+    days = md.days
+    print(f"[serial] {len(days)} tradable days ({days[0]} .. {days[-1]})", flush=True)
+    if cfg["require_news"] > 0 and cfg["use_advisor"]:
+        keep = days_with_news(days, os.path.join(ROOT, "data", "news"),
+                              cfg["require_news"])
+        if len(keep) >= 200:
+            md._index = keep
+            print(f"[serial] {len(keep)} days after news filter", flush=True)
+    adv = LLMAdvisor(os.path.join(ROOT, "models"),
+                     os.path.join(ROOT, "data", "news"),
+                     os.path.join(cfg["outdir"], "advisor_cache"),
+                     threads=cfg["advisor_threads"], batch=cfg["advisor_batch"],
+                     enabled=cfg["use_advisor"], model_names=cfg["advisor_models"])
+
+    pp = PricePredictor(cfg["n_feat"], nA, d, cfg["n_layers"]).to(dev)
+    ma = MarketAnalyzer(cfg["n_feat"], N_ADVISOR_FEAT, nA, d,
+                        max(2, cfg["n_layers"] - 1)).to(dev)
+    Pp = projection(d, PROJ_DIM, 1).to(dev)
+    Pm = projection(d, PROJ_DIM, 2).to(dev)
+    n_pred = nA * len(HORIZONS) * 2 + PROJ_DIM
+    n_reg = nA * 3 + nA + PROJ_DIM
+    n_port = nA + 4
+    pol = TraderPolicy(cfg["n_feat"] + N_ADVISOR_FEAT, n_pred, n_reg, n_port,
+                       nA, d, 2).to(dev)
+    o_pp = torch.optim.AdamW(pp.parameters(), lr=3e-4, weight_decay=1e-4)
+    o_ma = torch.optim.AdamW(ma.parameters(), lr=3e-4, weight_decay=1e-4)
+    o_po = torch.optim.AdamW(pol.parameters(), lr=cfg["lr"], eps=1e-5)
+    print(f"[serial] params  predictor={count_params(pp)/1e6:.2f}M  "
+          f"analyzer={count_params(ma)/1e6:.2f}M  trader={count_params(pol)/1e6:.2f}M  "
+          f"device={dev}", flush=True)
+
+    equities, returns, hits = [], [], []
+    losses = {"predictor": [], "analyzer": [], "policy": [], "value": []}
+    os.makedirs(cfg["outdir"], exist_ok=True)
+    metrics_path = os.path.join(cfg["outdir"], "metrics.jsonl")
+
+    for ep in range(nepochs):
+        t_ep = time.time()
+        e = None
+        for _ in range(12):
+            day = md.sample_day(rng, cfg["day_lo"], cfg["day_hi"])
+            e = md.episode(day)
+            if e is not None:
+                break
+        if e is None:
+            continue
+        t_adv = time.time()
+        av, notes = adv.day_track(day, e["timestamps"], ASSETS,
+                                  every=cfg["advisor_every"])
+        adv_secs = time.time() - t_adv
+
+        X = torch.from_numpy(e["features"]).unsqueeze(0).to(dev)
+        A = torch.from_numpy(av).unsqueeze(0).to(dev)
+        Y = torch.from_numpy(forward_targets(e["prices"], HORIZONS)).unsqueeze(0).to(dev)
+        RY = torch.from_numpy(regime_labels(e["prices"])).unsqueeze(0).to(dev)
+        VY = torch.from_numpy(realised_vol(e["prices"])).unsqueeze(0).to(dev)
+
+        pp.train(); pl = 0.0
+        for _ in range(cfg["inner_steps"]):
+            o_pp.zero_grad(set_to_none=True)
+            l = pp.loss(X, Y); l.backward()
+            torch.nn.utils.clip_grad_norm_(pp.parameters(), 1.0); o_pp.step()
+            pl += float(l.detach())
+        ma.train(); al = 0.0
+        for _ in range(cfg["inner_steps"]):
+            o_ma.zero_grad(set_to_none=True)
+            l, _, _ = ma.loss(X, A, RY, VY); l.backward()
+            torch.nn.utils.clip_grad_norm_(ma.parameters(), 1.0); o_ma.step()
+            al += float(l.detach())
+
+        pp.eval(); ma.eval()
+        with torch.no_grad():
+            mu, ls, hp = pp(X)
+            rl, vol, hm = ma(X, A)
+            T = X.shape[1]
+            pred_np = torch.cat([mu.reshape(T, -1), ls.reshape(T, -1),
+                                 hp[0] @ Pp], -1).float().cpu().numpy()
+            reg_np = torch.cat([torch.softmax(rl[0], -1).reshape(T, -1),
+                                vol[0], hm[0] @ Pm], -1).float().cpu().numpy()
+            pred_track = mu[0, :, 2, :].float().cpu().numpy()
+            reg_track = torch.softmax(rl[0, :, 0, :], -1).float().cpu().numpy()
+
+        env = TradingEnv({"prices": e["prices"], "features": e["features"],
+                          "warmup": e["warmup"]}, av,
+                         decision_every=cfg["decision_every"], fee=cfg["fee"],
+                         max_gross=cfg["max_gross"])
+        o = env.reset()
+        O, ACT, LOGP, VAL, REW = [], [], [], [], []
+        hx = None
+        while True:
+            t = o["t"]
+            obs = np.concatenate([o["market"], o["advisor"], pred_np[t],
+                                  reg_np[t], o["portfolio"]])
+            ot = torch.from_numpy(obs).float().unsqueeze(0).to(dev)
+            with torch.no_grad():
+                a, lp, v, hx = pol.act(ot, hx)
+            o, r, done, info = env.step(a[0].cpu().numpy())
+            O.append(obs); ACT.append(a[0].cpu().numpy())
+            LOGP.append(float(lp)); VAL.append(float(v)); REW.append(r)
+            if done:
+                break
+
+        R = np.asarray(REW, np.float32); V = np.asarray(VAL, np.float32)
+        gae = np.zeros_like(R); last = 0.0
+        for i in reversed(range(len(R))):
+            nv = 0.0 if i == len(R) - 1 else V[i + 1]
+            last = (R[i] + cfg["gamma"] * nv - V[i]) + cfg["gamma"] * cfg["lam"] * last
+            gae[i] = last
+        ret_t = torch.from_numpy(gae + V).to(dev)
+        adv_t = torch.from_numpy((gae - gae.mean()) / (gae.std() + 1e-8)).to(dev)
+        obs_t = torch.from_numpy(np.asarray(O, np.float32)).to(dev)
+        act_t = torch.from_numpy(np.asarray(ACT, np.float32)).to(dev)
+        old_lp = torch.from_numpy(np.asarray(LOGP, np.float32)).to(dev)
+
+        plo = vlo = 0.0
+        for _ in range(cfg["ppo_epochs"]):
+            hx2 = None; lps = []; ents = []; vs = []
+            for i in range(obs_t.shape[0]):
+                a_, b_, c_, hx2 = pol.evaluate(obs_t[i:i+1], act_t[i:i+1], hx2)
+                lps.append(a_); ents.append(b_); vs.append(c_)
+            lp_all = torch.cat(lps); ent = torch.cat(ents).mean(); v_all = torch.cat(vs)
+            ratio = (lp_all - old_lp).clamp(-10, 10).exp()
+            p_loss = -torch.min(ratio * adv_t,
+                                ratio.clamp(1-cfg["clip"], 1+cfg["clip"]) * adv_t).mean()
+            v_loss = torch.nn.functional.smooth_l1_loss(v_all, ret_t)
+            loss = p_loss + cfg["vf_coef"] * v_loss - cfg["ent_coef"] * ent
+            o_po.zero_grad(set_to_none=True); loss.backward()
+            torch.nn.utils.clip_grad_norm_(pol.parameters(), 0.5); o_po.step()
+            plo += float(p_loss.detach()); vlo += float(v_loss.detach())
+
+        equities.append(info["equity"]); returns.append(info["return_pct"])
+        hits.append(1.0 if info["hit_target"] else 0.0)
+        losses["predictor"].append(pl/cfg["inner_steps"])
+        losses["analyzer"].append(al/cfg["inner_steps"])
+        losses["policy"].append(plo/cfg["ppo_epochs"])
+        losses["value"].append(vlo/cfg["ppo_epochs"])
+        rec = {"epoch": ep, "day": day, **info,
+               "pred_loss": losses["predictor"][-1],
+               "anal_loss": losses["analyzer"][-1],
+               "policy_loss": losses["policy"][-1],
+               "value_loss": losses["value"][-1],
+               "advisor_secs": round(adv_secs, 2),
+               "epoch_secs": round(time.time()-t_ep, 2),
+               "hit_rate_100": float(np.mean(hits[-100:]))}
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"[serial] ep{ep:<5} {day}  ${info['equity']:7.2f} "
+              f"({info['return_pct']:+7.2f}%)  "
+              f"{'TARGET' if info['hit_target'] else '      '}  "
+              f"sharpe={info['sharpe']:+.2f}  pnl_loss={pl/cfg['inner_steps']:.3f}  "
+              f"adv={adv_secs:.1f}s  tot={time.time()-t_ep:.1f}s", flush=True)
+
+        if ep % cfg["png_every"] == 0:
+            viz.save_epoch_png(
+                os.path.join(cfg["outdir"], "epochs",
+                             f"epoch_{ep:06d}_{day}.png"),
+                ep, day, env.hist, info, ASSETS, notes, losses, equities,
+                regime_track=reg_track[env.hist["t"]],
+                pred_track=pred_track[env.hist["t"]],
+                sentiment_track=av[env.hist["t"]])
+        if (ep + 1) % cfg["ckpt_every"] == 0:
+            for nm, net in (("price_predictor", pp), ("market_analyzer", ma),
+                            ("trader_policy", pol)):
+                torch.save(net.state_dict(), os.path.join(cfg["ckpt"], nm + ".pt"))
+
+    for nm, net in (("price_predictor", pp), ("market_analyzer", ma),
+                    ("trader_policy", pol)):
+        torch.save(net.state_dict(), os.path.join(cfg["ckpt"], nm + ".pt"))
+    if equities:
+        viz.save_summary_png(os.path.join(cfg["outdir"], "summary.png"),
+                             equities, returns, hits)
+    print("[serial] done", flush=True)
+
+
 # ----------------------------------------------------------------------------
 def build_cfg(args, plan):
     n_feat = len(ASSETS) * 12 + N_TIME_FEAT
@@ -429,6 +615,8 @@ def build_cfg(args, plan):
         "outdir": args.outdir, "ckpt": args.ckpt,
         "day_lo": args.day_lo, "day_hi": args.day_hi,
         "require_news": args.require_news,
+        "advisor_models": ([m for m in args.advisor_models.split(",") if m]
+                           or None),
     }
 
 
@@ -461,6 +649,10 @@ def main():
     p.add_argument("--require-news", type=int, default=3,
                    help="only sample days with >=N articles in the trailing 7d "
                         "(0 disables)")
+    p.add_argument("--advisor-models", default="",
+                   help="comma-separated subset of models/ to load (default all)")
+    p.add_argument("--serial", action="store_true",
+                   help="run all three agents in one process")
     p.add_argument("--queue-size", type=int, default=4)
     args = p.parse_args()
 
@@ -476,6 +668,13 @@ def main():
     print(json.dumps({k: cfg[k] for k in
                       ("d_model", "n_layers", "amp", "dev_predictor",
                        "dev_analyzer", "dev_trader")}, indent=2), flush=True)
+
+    if args.serial:
+        t0 = time.time()
+        serial_loop(cfg, args.epochs)
+        print(f"\nTRAINING COMPLETE in {(time.time()-t0)/60:.1f} min", flush=True)
+        print(f"artifacts -> {args.outdir}", flush=True)
+        return
 
     ctx = mp.get_context("spawn")
     mgr = ctx.Manager()
