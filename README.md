@@ -15,7 +15,7 @@ which is what makes it runnable inside a Snowflake workspace that can only
 | Path | Contents |
 |---|---|
 | `data/market/{BTC,ETH,LTC}USDT/` | **14.07M** 1-minute bars, 2017-08-17 → 2026-08-31, one Parquet per year (zstd) |
-| `data/news/` | **104,606** dated news articles, 2011 → 2026, one Parquet per year + `daily_index.parquet` |
+| `data/news/` | **126,746** dated news articles, 2011 → 2026, one Parquet per year + `daily_index.parquet` |
 | `models/` | 3 CPU sentiment encoders, weights split into <90 MB chunks |
 | `src/` | dataset, advisor, networks, environment, trainer, plotting |
 | `scripts/` | `bootstrap.py` (run once offline), `smoke_test.py` |
@@ -28,18 +28,26 @@ corrected). **3,178 days** have complete coverage across all three assets —
 that is the epoch sampling pool.
 
 ### News corpus
-| Source | Rows |
+| Source | What it gives |
 |---|---|
 | `edaschau/bitcoin_news` (HF) | dated BTC headlines + bodies, 2011-2025 |
 | `SahandNZ/cryptonews-articles` (HF) | cryptonews.com, 2021-2023 |
-| Cointelegraph sitemaps | ~76k dated article URLs incl. 2026 |
+| Cointelegraph sitemaps | dated article URLs |
+| cryptoslate / newsbtc / bitcoinist / ambcrypto sitemaps | 2014-2026, fills the recent window |
 
-Tagged per asset: BTC 50,281 · MKT 43,975 · ETH 9,204 · LTC 1,146.
-2,852 of the 3,178 tradable days (90%) have news; median 17 articles/day.
+Tagged per asset: BTC 59,957 · MKT 49,435 · ETH 15,260 · LTC 2,094.
 
-> **Caveat:** Cointelegraph rows are dated by sitemap `lastmod`, which is the
-> modification time, not necessarily first publication. LTC coverage is
-> genuinely thin — the advisor leans on the BTC/MKT signal for LTC.
+**Coverage: 3,183 / 3,183 tradable days (100%)** have news behind them —
+median 253 articles in the trailing 7-day window, worst case 34.
+
+> **De-spiking.** Sitemap `<lastmod>` is a *modification* time. When an outlet
+> bulk-re-touches its archive, thousands of old articles collapse onto one
+> date (Cointelegraph dumped 14,787 rows onto 2026-07-07). Those carry false
+> timestamps and would inject phantom news, so `despike()` drops any
+> `(domain, date)` bucket above 250 articles — **55,847 rows removed**.
+>
+> LTC coverage is genuinely thin (2,094 rows); the advisor leans on the
+> BTC/MKT channel for LTC.
 
 ### Models (CPU advisor)
 | Dir | Upstream | Params | Chunks |
@@ -122,6 +130,8 @@ Useful flags:
 --cpu                 no CUDA at all
 --day-lo / --day-hi   restrict the sampling pool (e.g. train/test split)
 --no-advisor          ablate the news channel
+--require-news N      only sample days with >=N articles in the trailing 7d
+                      (default 3; stops the agent training on silent stretches)
 --png-every N         save a diagnostic PNG every N epochs
 ```
 

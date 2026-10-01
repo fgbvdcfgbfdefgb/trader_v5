@@ -171,3 +171,33 @@ def forward_targets(prices: np.ndarray, horizons=(1, 5, 15, 60)) -> np.ndarray:
         f = np.concatenate([lp[h:], np.repeat(lp[-1:], h, axis=0)], axis=0)
         outs.append((f - lp) * 100.0)
     return np.stack(outs, axis=1).astype(np.float32)   # [T, H, A]
+
+
+def days_with_news(days, news_dir: str, min_articles: int = 3,
+                   trail_days: int = 7):
+    """
+    Keep only days that actually have news behind them.
+
+    The advisor reads a trailing window, so a day is usable when the sum of
+    articles over the preceding `trail_days` reaches `min_articles`. Without
+    this the agent would be trained on stretches where the news channel is
+    silently all-zero, which quietly destroys the signal.
+    """
+    import glob as _glob
+    idx_p = os.path.join(news_dir, "daily_index.parquet")
+    if os.path.exists(idx_p):
+        idx = pd.read_parquet(idx_p)
+        cnt = idx.groupby("date")["n_articles"].sum()
+    else:
+        fs = _glob.glob(os.path.join(news_dir, "news_*.parquet"))
+        if not fs:
+            return list(days)
+        d = pd.concat([pd.read_parquet(f, columns=["date"]) for f in fs])
+        cnt = d.groupby("date").size()
+    cnt.index = pd.to_datetime(cnt.index)
+    full = pd.date_range(min(cnt.index.min(), pd.Timestamp(days[0])),
+                         max(cnt.index.max(), pd.Timestamp(days[-1])), freq="D")
+    cnt = cnt.reindex(full, fill_value=0)
+    roll = cnt.rolling(trail_days, min_periods=1).sum()
+    ok = set(roll[roll >= min_articles].index.strftime("%Y-%m-%d"))
+    return [d for d in days if d in ok]

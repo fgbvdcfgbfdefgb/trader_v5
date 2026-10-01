@@ -37,7 +37,8 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import resources                                     # noqa: E402
-from dataset import MarketData, forward_targets, ASSETS, N_TIME_FEAT  # noqa: E402
+from dataset import (MarketData, forward_targets, ASSETS, N_TIME_FEAT,
+                     days_with_news)  # noqa: E402
 from advisor import LLMAdvisor, N_ADVISOR_FEAT       # noqa: E402
 from env import TradingEnv, regime_labels, realised_vol, START_CASH, TARGET  # noqa: E402
 from nets import (PricePredictor, MarketAnalyzer, TraderPolicy, HORIZONS,
@@ -72,6 +73,18 @@ def producer_proc(cfg, qs, stop, nepochs):
         days = md.days
         print(f"[producer] {len(days)} tradable days "
               f"({days[0]} .. {days[-1]})", flush=True)
+        if cfg["require_news"] > 0 and cfg["use_advisor"]:
+            keep = days_with_news(days, os.path.join(ROOT, "data", "news"),
+                                  cfg["require_news"])
+            if len(keep) >= 200:
+                md._index = keep
+                days = keep
+                print(f"[producer] {len(days)} days kept after requiring >="
+                      f"{cfg['require_news']} articles in the trailing 7d "
+                      f"({days[0]} .. {days[-1]})", flush=True)
+            else:
+                print(f"[producer] news filter would leave only {len(keep)} "
+                      f"days - ignoring it", flush=True)
         adv = LLMAdvisor(
             os.path.join(ROOT, "models"), os.path.join(ROOT, "data", "news"),
             os.path.join(ROOT, "outputs", "advisor_cache"),
@@ -415,6 +428,7 @@ def build_cfg(args, plan):
         "png_every": args.png_every, "ckpt_every": args.ckpt_every,
         "outdir": args.outdir, "ckpt": args.ckpt,
         "day_lo": args.day_lo, "day_hi": args.day_hi,
+        "require_news": args.require_news,
     }
 
 
@@ -444,6 +458,9 @@ def main():
     p.add_argument("--ckpt", default=os.path.join(ROOT, "outputs", "checkpoints"))
     p.add_argument("--day-lo", default="")
     p.add_argument("--day-hi", default="")
+    p.add_argument("--require-news", type=int, default=3,
+                   help="only sample days with >=N articles in the trailing 7d "
+                        "(0 disables)")
     p.add_argument("--queue-size", type=int, default=4)
     args = p.parse_args()
 

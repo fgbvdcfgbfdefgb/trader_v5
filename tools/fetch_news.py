@@ -23,6 +23,7 @@ import sys
 import time
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -153,6 +154,78 @@ def src_cointelegraph(session, max_maps=6):
 
 
 # ------------------------------------------------------------------ source 4
+WP_SITES = {
+    "cryptoslate.com": "https://cryptoslate.com/sitemap_index.xml",
+    "newsbtc.com": "https://www.newsbtc.com/sitemap_index.xml",
+    "bitcoinist.com": "https://bitcoinist.com/sitemap_index.xml",
+    "ambcrypto.com": "https://ambcrypto.com/sitemap_index.xml",
+}
+WP_SLUG = re.compile(r"https?://[^/]+/(?:news/|\d{4}/\d{2}/\d{2}/)?([a-z0-9\-]{12,})/?$")
+
+
+def src_wordpress(session, max_maps_per_site=80):
+    """
+    WordPress post-sitemaps carry a per-article <lastmod> that, for news
+    outlets, tracks publication closely. Headline is recovered from the slug.
+    """
+    rows = []
+    for domain, idx in WP_SITES.items():
+        try:
+            r = session.get(idx, timeout=90, headers=UA)
+            maps = [m for m in re.findall(r"<loc>(.*?)</loc>", r.text)
+                    if "post-sitemap" in m]
+        except Exception as e:
+            print(f"  [warn] {domain}: {e}", flush=True)
+            continue
+        maps = maps[-max_maps_per_site:]          # newest chunks first
+        got = 0
+        for u in maps:
+            try:
+                rr = session.get(u, timeout=90, headers=UA)
+            except Exception:
+                continue
+            locs = re.findall(r"<loc>(.*?)</loc>", rr.text)
+            mods = re.findall(r"<lastmod>(.*?)</lastmod>", rr.text)
+            if len(locs) != len(mods):
+                continue
+            for loc, mod in zip(locs, mods):
+                m = WP_SLUG.match(loc)
+                if not m:
+                    continue
+                title = m.group(1).replace("-", " ").strip()
+                if len(title) < 12:
+                    continue
+                t = pd.to_datetime(mod, utc=True, errors="coerce")
+                if pd.isna(t):
+                    continue
+                for a in tag_assets(title):
+                    rows.append({"date": t.strftime("%Y-%m-%d"),
+                                 "datetime_utc": t.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "asset": a, "title": title[:300],
+                                 "domain": domain, "url": loc[:300],
+                                 "language": "en"})
+                    got += 1
+            del rr
+        print(f"  {domain}: {len(maps)} sitemaps -> {got} tagged rows", flush=True)
+    return rows
+
+
+def despike(df, max_per_domain_day=250):
+    """
+    Sitemap <lastmod> is a *modification* time. When a site bulk-re-touches its
+    archive, thousands of old articles collapse onto one date. Those rows carry
+    a false timestamp and would inject phantom news, so drop any
+    (domain, date) bucket that is implausibly large.
+    """
+    g = df.groupby(["domain", "date"]).size()
+    bad = set(g[g > max_per_domain_day].index)
+    if not bad:
+        return df, 0
+    key = list(zip(df["domain"], df["date"]))
+    mask = np.array([k not in bad for k in key])
+    return df[mask].reset_index(drop=True), int((~mask).sum())
+
+
 def src_gdelt(session, start_year, sleep=12.0):
     Q = {"BTC": "(bitcoin OR BTC) (crypto OR price OR market)",
          "ETH": "(ethereum OR ETH) (crypto OR price OR market)",
@@ -202,16 +275,20 @@ def main():
     s = requests.Session()
     rows = []
 
-    print("[1/3] HF edaschau/bitcoin_news", flush=True)
+    print("[1/4] HF edaschau/bitcoin_news", flush=True)
     rows += src_bitcoin_news(s)
     print(f"  -> {len(rows)} rows", flush=True)
 
-    print("[2/3] HF SahandNZ/cryptonews", flush=True)
+    print("[2/4] HF SahandNZ/cryptonews", flush=True)
     rows += src_cryptonews(s)
     print(f"  -> {len(rows)} rows", flush=True)
 
-    print("[3/3] Cointelegraph sitemaps", flush=True)
+    print("[3/4] Cointelegraph sitemaps", flush=True)
     rows += src_cointelegraph(s)
+    print(f"  -> {len(rows)} rows", flush=True)
+
+    print("[4/4] WordPress crypto outlets", flush=True)
+    rows += src_wordpress(s)
     print(f"  -> {len(rows)} rows", flush=True)
 
     if args.gdelt:
@@ -222,6 +299,8 @@ def main():
     if df.empty:
         print("NO NEWS COLLECTED"); return
     df = df.drop_duplicates(subset=["url", "asset", "title"])
+    df, nd = despike(df)
+    print(f"  de-spiked {nd:,} rows from bulk sitemap re-touches", flush=True)
     df = df.sort_values("datetime_utc").reset_index(drop=True)
 
     # merge anything already on disk (resume-friendly)
